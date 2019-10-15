@@ -3,6 +3,7 @@ import torch.nn as nn
 import traceback
 from Caffe import caffe_net
 import torch.nn.functional as F
+from torch import Tensor
 from torch.autograd import Variable
 from Caffe import layer_param
 from torch.nn.modules.utils import _pair
@@ -148,8 +149,15 @@ def _split(raw,tensor, split_size, dim=0):
     top_blobs=log.add_blobs(x,name='split_blob')
     layer=caffe_net.Layer_param(name=layer_name, type='Slice',
                                 bottom=[log.blobs(tensor)], top=top_blobs)
-    slice_num=int(np.floor(tensor.size()[dim]/split_size))
-    slice_param=caffe_net.pb.SliceParameter(axis=dim,slice_point=[split_size*i for i in range(1,slice_num)])
+    if not isinstance(split_size, (list, tuple)):
+        # int, split size
+        slice_num=int(np.floor(tensor.size()[dim]/split_size))
+        slice_param=caffe_net.pb.SliceParameter(axis=dim,slice_point=[split_size*i for i in range(1,slice_num)])
+    else:
+        # split sections
+        for i in range(1, len(split_size)):
+            split_size[i] += split_size[i-1]
+        slice_param=caffe_net.pb.SliceParameter(axis=dim, slice_point=split_size[:-1])
     layer.param.slice_param.CopyFrom(slice_param)
     log.cnet.add_layer(layer)
     return x
@@ -262,6 +270,17 @@ def _relu(raw, input, inplace=False):
                                   bottom=[log.blobs(input)], top=[log.blobs(x)])
     log.cnet.add_layer(layer)
     return x
+
+def _relu6(raw, input, inplace=False):
+    # FIXME: as dpu do not suppport relu6, try use relu
+    x = raw(input, False)
+    name = log.add_layer(name='relu')
+    log.add_blobs([x], name='relu_blob')
+    layer = caffe_net.Layer_param(name=name, type='ReLU',
+                                  bottom=[log.blobs(input)], top=[log.blobs(x)])
+    log.cnet.add_layer(layer)
+    return x
+
 def _prelu(raw, input, weight):
     # for threshold or prelu
     x = raw(input, weight)
@@ -412,6 +431,7 @@ def _sigmoid(raw, input):
     layer = caffe_net.Layer_param(name=name, type='Sigmoid',
                                   bottom=[log.blobs(input)], top=[log.blobs(x)])
     log.cnet.add_layer(layer)
+    return x
 
 #tanh layer
 def _tanh(raw, input):
@@ -426,6 +446,7 @@ def _tanh(raw, input):
     layer = caffe_net.Layer_param(name=name, type='TanH',
                                   bottom=[log.blobs(input)], top=[log.blobs(x)])
     log.cnet.add_layer(layer)
+    return x
 
 # ----- for Variable operations --------
 
@@ -469,9 +490,15 @@ def _add(input, *args):
         return x
     layer_name = log.add_layer(name='add')
     top_blobs = log.add_blobs([x], name='add_blob')
-    layer = caffe_net.Layer_param(name=layer_name, type='Eltwise',
-                                  bottom=[log.blobs(input),log.blobs(args[0])], top=top_blobs)
-    layer.param.eltwise_param.operation = 1 # sum is 1
+    if isinstance(args[0], (int, float)):
+        # handle add constant bias
+        layer = caffe_net.Layer_param(name=layer_name, type='Bias', bottom=[log.blobs(input)], top=top_blobs)
+        layer.bias_param(args[0], trainable=False)
+    else:
+        # elementwise add
+        layer = caffe_net.Layer_param(name=layer_name, type='Eltwise',
+                                      bottom=[log.blobs(input),log.blobs(args[0])], top=top_blobs)
+        layer.param.eltwise_param.operation = 1 # sum is 1
     log.cnet.add_layer(layer)
     return x
 
@@ -560,6 +587,8 @@ class Rp(object):
                     log.pytorch_layer_name=layer_names[layer]
                     print(layer_names[layer])
                     break
+        # import ipdb
+        # ipdb.set_trace()
         out=self.obj(self.raw,*args,**kwargs)
         # if isinstance(out,Variable):
         #     out=[out]
@@ -571,6 +600,7 @@ class Rp(object):
 F.conv2d=Rp(F.conv2d,_conv2d)
 F.linear=Rp(F.linear,_linear)
 F.relu=Rp(F.relu,_relu)
+F.relu6=Rp(F.relu6,_relu6)
 F.leaky_relu=Rp(F.leaky_relu,_leaky_relu)
 F.max_pool2d=Rp(F.max_pool2d,_max_pool2d)
 F.avg_pool2d=Rp(F.avg_pool2d,_avg_pool2d)
@@ -583,6 +613,7 @@ F.softmax=Rp(F.softmax,_softmax)
 F.conv_transpose2d=Rp(F.conv_transpose2d,_conv_transpose2d)
 F.interpolate = Rp(F.interpolate,_interpolate)
 F.sigmoid = Rp(F.sigmoid,_sigmoid)
+torch.sigmoid = Rp(torch.sigmoid,_sigmoid)
 F.tanh = Rp(F.tanh,_tanh)
 
 
@@ -590,6 +621,8 @@ torch.split=Rp(torch.split,_split)
 torch.max=Rp(torch.max,_max)
 torch.cat=Rp(torch.cat,_cat)
 
+def _v_sigmoid(tensor):
+    return torch.sigmoid(tensor)
 
 # TODO: other types of the view function
 try:
@@ -597,6 +630,7 @@ try:
     Variable.view=_view
     raw_mean=Variable.mean
     Variable.mean=_mean
+    # Variable.sigmoid = _v_sigmoid
     raw__add__=Variable.__add__
     Variable.__add__=_add
     raw__iadd__=Variable.__iadd__
@@ -614,6 +648,7 @@ except:
     for t in [torch.Tensor]:
         raw_view = t.view
         t.view = _view
+        t.sigmoid = _v_sigmoid
         raw_mean = t.mean
         t.mean = _mean
         raw__add__ = t.__add__

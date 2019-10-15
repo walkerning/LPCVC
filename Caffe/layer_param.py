@@ -32,6 +32,14 @@ class Layer_param():
         self.bottom=self.param.bottom
         self.bottom.extend(bottom)
 
+    def bias_param(self, bias, trainable=False):
+        if self.type != "Bias":
+            raise TypeError()
+        b_param = pb.BiasParameter(filler=pb.FillerParameter(type='constant', value=bias))
+        if not trainable:
+            self.param.param.append(pb.ParamSpec(lr_mult=0, decay_mult=0))
+        self.param.bias_param.CopyFrom(b_param)
+
     def fc_param(self, num_output, weight_filler='xavier', bias_filler='constant',has_bias=True):
         if self.type != 'InnerProduct':
             raise TypeError('the layer type must be InnerProduct if you want set fc param')
