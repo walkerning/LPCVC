@@ -542,19 +542,37 @@ def _isub(input, *args):
     return x
 
 def _mul(input, *args):
-    x = raw__sub__(input, *args)
+    x = raw__mul__(input, *args)
     if not NET_INITTED:
         return x
-    layer_name = log.add_layer(name='mul')
-    top_blobs = log.add_blobs([x], name='mul_blob')
-    layer = caffe_net.Layer_param(name=layer_name, type='Eltwise',
-                                  bottom=[log.blobs(input), log.blobs(args[0])], top=top_blobs)
-    layer.param.eltwise_param.operation = 0  # product is 1
+    # element wise mul using scale layer
+    assert args[0].shape[0] == input.shape[0] and args[0].shape[1] == input.shape[1]
+    if not (args[0].shape[2] == input.shape[2] and args[0].shape[3] == input.shape[3]):
+        print("WARNING: DPU cannot handle this implictly-broadcast elementwise multiplication efficiently! {} with {}".format(args[0].shape, input.shape))
+        # Handle implicitly broadcast in pytorch, reshape -> scale;
+        # Actually this is not support by DPU (2019.10.16)
+        # add reshape layer
+        assert args[0].shape[2] == 1 and args[0].shape[3] == 1
+        layer_name = log.add_layer(name="reshape")
+        y = args[0].view(args[0].shape[0], -1)
+        layer_name = log.add_layer(name='mul')
+        top_blobs = log.add_blobs([x], name='mul_blob')
+        layer = caffe_net.Layer_param(name=layer_name, type='Scale',
+                                      bottom=[log.blobs(input), log.blobs(y)], top=top_blobs)
+        layer.param.scale_param.bias_term = False
+        layer.param.scale_param.axis = 0
+    else:
+        # acutally, dpu only support elementwise...
+        layer_name = log.add_layer(name='mul')
+        top_blobs = log.add_blobs([x], name='mul_blob')
+        layer = caffe_net.Layer_param(name=layer_name, type='Eltwise',
+                                      bottom=[log.blobs(input), log.blobs(args[0])], top=top_blobs)
+        layer.param.eltwise_param.operation = 0  # product is 1
     log.cnet.add_layer(layer)
     return x
 
 def _imul(input, *args):
-    x = raw__isub__(input, *args)
+    x = raw__imul__(input, *args)
     if not NET_INITTED:
         return x
     x = x.clone()
