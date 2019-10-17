@@ -18,10 +18,11 @@ from torch.autograd import Variable
 
 import pytorch_to_caffe
 import gen_efficientnet
+from nxmodel import gen_overall_model
 
 from torchvision import models
 
-CALIB_ITER = 100
+calib_iter = 1
 
 data_input_str = """
 
@@ -33,8 +34,8 @@ layer {
     shape {
       dim: 1
       dim: 3
-      dim: 224
-      dim: 224
+      dim: INPUT_SIZE
+      dim: INPUT_SIZE
     }
   }
 }
@@ -49,7 +50,7 @@ layer {
   top: "data"
   top: "label"
   transform_param {
-    crop_size: 224
+    crop_size: INPUT_SIZE
     mean_value: 103.53
     mean_value: 116.28
     mean_value: 123.675
@@ -65,7 +66,7 @@ layer {
 }
 
 """
-def caffe_fix(prototxt, caffemodel, output_dir, gpu):
+def caffe_fix(prototxt, caffemodel, output_dir, gpu, calib_iter, input_size=224, debug=False):
     print("-------- Run caffe deephi_fix --------")
     ## Modify the data layer in the input prototxt
     # As anyway dnnc's inner caffe verrsion do not support `ceil_mode`, we just remove this config here.
@@ -74,7 +75,7 @@ def caffe_fix(prototxt, caffemodel, output_dir, gpu):
     input_prototxt = prototxt + ".tofix.prototxt"
     subprocess.check_call("cat {} | sed '/ceil_mode/d' | sed '/input_dim/d' | sed '/input:/d' | sed 's/\"blob1\"/\"data\"/' > {}".format(prototxt, input_prototxt), shell=True)
     with open(input_prototxt, "r") as rf:
-        content = data_layer_str + rf.read()
+        content = data_layer_str.replace("INPUT_SIZE", str(input_size)) + rf.read()
     with open(input_prototxt, "w") as wf:
         wf.write(content)
     print("Fixed-point input prototxt saved to {}.".format(input_prototxt))
@@ -86,9 +87,10 @@ def caffe_fix(prototxt, caffemodel, output_dir, gpu):
     print("Running deephi_fix, log will be saved to {}.".format(log_file))
     with open(log_file, "w") as logf:
         subprocess.check_call("/home/foxfi/projects/caffe_dev/build/tools/deephi_fix fix -calib_iter {} -gpu {} -model {} -weights {} -output_dir {}".format(
-        CALIB_ITER, args.gpu, input_prototxt, caffemodel, output_dir),
+        calib_iter, args.gpu, input_prototxt, caffemodel, output_dir),
                               shell=True,
-                              stdout=logf)
+                              stdout=logf,
+                              stderr=logf)
     print("Finish running deephi_fix, check output dir {}.".format(output_dir))
 
     ## modify the generated deploy.prototxt to be compatible with dnnc
@@ -102,19 +104,29 @@ def caffe_fix(prototxt, caffemodel, output_dir, gpu):
     print("Finish generating dnnc-compatible prototxt: {}, weights: {}.".format(mod_output_prototxt, output_caffemodel))
     return mod_output_prototxt, output_caffemodel
 
-def run_pytorch_to_caffe(name, output_dir, pretrained=True):
+def run_pytorch_to_caffe(name, output_dir, pretrained=True, input_size=224, debug=False):
     print("-------- Run pytorch to caffe --------")
     # TODO: save output to log?
-    if not hasattr(gen_efficientnet, name):
+    if hasattr(gen_efficientnet, name):
+        model_cls = getattr(gen_efficientnet, name)
+    elif hasattr(gen_overall_model, name):
+        model_cls = getattr(gen_overall_model, name)
+    elif hasattr(models, name):
         model_cls = getattr(models, name)
     else:
-        model_cls = getattr(gen_efficientnet, name)
-        
+        raise Exception()
+
     net = model_cls(pretrained=pretrained)
     net.eval()
-    inputs = Variable(torch.ones([1, 3, 224, 224]))
+    inputs = Variable(torch.ones([1, 3, input_size, input_size]))
+
+    if not debug:
+        backup_stdout = sys.stdout
+        sys.stdout = open("/dev/null", "w")
     pytorch_to_caffe.trans_net(net, inputs, name)
-    
+    if not debug:
+        sys.stdout = backup_stdout
+
     dest = output_dir
     os.makedirs(dest, exist_ok=True)
     out_proto = "{}/{}.prototxt".format(dest, name)
@@ -124,12 +136,13 @@ def run_pytorch_to_caffe(name, output_dir, pretrained=True):
     print("Finish convert pytorch model to caffe, check {} and {}.".format(out_proto, out_caffemodel))
     return out_proto, out_caffemodel
 
-def run_dnnc(name, prototxt, caffemodel, output_dir, dcf, mode):
+def run_dnnc(name, prototxt, caffemodel, output_dir, dcf, mode, debug=False):
     print("-------- Run dnnc --------")
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
-    subprocess.check_call("dnnc --mode {mode} --cpu_arch arm64 --save_kernel --prototxt {prototxt} --caffemodel {caffemodel}  --output_dir {output_dir} --dcf {dcf} --net_name {name}".format(
-        name=name, prototxt=prototxt, caffemodel=caffemodel, output_dir=output_dir, dcf=dcf, mode=mode
+    subprocess.check_call("dnnc --mode {mode} --cpu_arch arm64 --save_kernel --prototxt {prototxt} --caffemodel {caffemodel}  --output_dir {output_dir} --dcf {dcf} --net_name {name}{debug_cmd}".format(
+        name=name, prototxt=prototxt, caffemodel=caffemodel, output_dir=output_dir, dcf=dcf, mode=mode,
+        debug_cmd=" --dump=all" if debug else ""
     ), shell=True)
     output_elf = os.path.join(output_dir, "dpu_{}.elf".format(name))
     print("Finish running dnnc for {} (mode: {}), elf file: {}.".format(name, mode, output_elf))
@@ -139,38 +152,69 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-n", "--net", required=True)
     parser.add_argument("--dir", default=None)
-    parser.add_argument("--gpu", default="0")
-    parser.add_argument("--dcf", default="/home/foxfi/projects/lpcvc/PytorchToCaffe/converted_results/mnasnet_100/Ultra96.dcf")
-    parser.add_argument("--mode", choices=["normal", "debug"], default="debug")
-    parser.add_argument("--no-pretrained", default=False, action="store_true")
     parser.add_argument("--begin-stage", default=0, type=int)
     parser.add_argument("--end-stage", default=2, type=int)
+    parser.add_argument("--debug", default=False, action="store_true")
+    # pytorch to caffe
+    parser.add_argument("--no-pretrained", default=False, action="store_true")
+    parser.add_argument("--input-size", default=224, type=int)
+    # caffe fix
+    parser.add_argument("--gpu", default="0")
+    parser.add_argument("--calib-iter", default=100, type=int)
+    # dnnc
+    parser.add_argument("--dcf", default="/home/foxfi/projects/lpcvc/PytorchToCaffe/converted_results/mnasnet_100/Ultra96.dcf")
+    parser.add_argument("--mode", choices=["normal", "debug"], default="debug")
+
     args = parser.parse_args()
+
+    if not args.debug:
+        print("Can use `--debug` mode to print out detailed infos when encountering any errror")
 
     dir_name = args.dir if args.dir is not None else args.net
     out_dir = os.path.join("elf_results/{}".format(dir_name))
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
 
-    ptc_out_dir = os.path.join(out_dir, "pytorch_to_caffe")
-    if args.begin_stage <= 0:
-        proto, model = run_pytorch_to_caffe(args.net, ptc_out_dir, pretrained=not args.no_pretrained)
-    else:
-        proto = "{}/{}.prototxt".format(ptc_out_dir, args.net)
-        model = "{}/{}.caffemodel".format(ptc_out_dir, args.net)
-    if args.end_stage <= 0:
-        sys.exit(0)
+    # save all cmdline outputs to record file
+    log_fname = os.path.join(out_dir, "gen_elf.log")
+    log_f = open(log_fname, "w")
+    try:
+        ori_print = print
+        def _print(*args, **kwargs):
+            res = ori_print(*args, **kwargs)
+            sys.stdout.flush()
+            # print to log file too
+            kwargs["file"] = log_f
+            ori_print(*args, **kwargs)
+            return res
+        print = _print
 
-    fix_out_dir = os.path.join(out_dir, "fix")
-    if args.begin_stage <= 1:
-        proto, model = caffe_fix(proto, model, fix_out_dir, args.gpu)
-    else:
-        proto = os.path.join(fix_out_dir, "deploy_dnnc.prototxt")
-        model = os.path.join(fix_out_dir, "deploy.caffemodel")
-    if args.end_stage <= 1:
-        sys.exit(0)
+        # pytorch to caffe
+        ptc_out_dir = os.path.join(out_dir, "pytorch_to_caffe")
+        if args.begin_stage <= 0:
+            proto, model = run_pytorch_to_caffe(args.net, ptc_out_dir,
+                                                pretrained=not args.no_pretrained, input_size=args.input_size, debug=args.debug)
+        else:
+            proto = "{}/{}.prototxt".format(ptc_out_dir, args.net)
+            model = "{}/{}.caffemodel".format(ptc_out_dir, args.net)
+        if args.end_stage <= 0:
+            sys.exit(0)
 
-    dnnc_out_dir = os.path.join(out_dir, "dnnc")
-    if args.begin_stage <= 2:
-        output_elf = run_dnnc(args.net, proto, model, dnnc_out_dir, args.dcf, args.mode)
-    else:
-        output_elf = os.path.join(dnnc_out_dir, "dpu_{}.elf".format(args.net))
+        # caffe fix
+        fix_out_dir = os.path.join(out_dir, "fix")
+        if args.begin_stage <= 1:
+            proto, model = caffe_fix(proto, model, fix_out_dir, args.gpu, args.calib_iter, args.input_size, debug=args.debug)
+        else:
+            proto = os.path.join(fix_out_dir, "deploy_dnnc.prototxt")
+            model = os.path.join(fix_out_dir, "deploy.caffemodel")
+        if args.end_stage <= 1:
+            sys.exit(0)
 
+        # dnnc
+        dnnc_out_dir = os.path.join(out_dir, "dnnc")
+        if args.begin_stage <= 2:
+            output_elf = run_dnnc(args.net, proto, model, dnnc_out_dir, args.dcf, args.mode, debug=args.debug)
+        else:
+            output_elf = os.path.join(dnnc_out_dir, "dpu_{}.elf".format(args.net))
+    finally:
+        log_f.close()

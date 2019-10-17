@@ -191,8 +191,8 @@ def _max_pool2d(raw,input, kernel_size, stride=None, padding=0, dilation=1,
     _pool('max',raw,input, x, kernel_size, stride, padding,ceil_mode)
     return x
 
-def _avg_pool2d(raw,input, kernel_size, stride = None, padding = 0, ceil_mode = False, count_include_pad = True):
-    x = raw(input, kernel_size, stride, padding, ceil_mode, count_include_pad)
+def _avg_pool2d(raw,input, kernel_size, stride = None, padding = 0, ceil_mode = False, count_include_pad = True, divisor_override=None):
+    x = raw(input, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override)
     _pool('ave',raw,input, x, kernel_size, stride, padding,ceil_mode)
     return x
 

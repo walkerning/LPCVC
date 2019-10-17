@@ -10,6 +10,7 @@ from torch.autograd import Variable
 
 import pytorch_to_caffe
 import gen_efficientnet
+from nxmodel import gen_overall_model
 
 from torchvision import models
 
@@ -21,12 +22,17 @@ args = parser.parse_args()
 dir_ = args.net if args.dir is None else args.dir
 name = args.net
 
-if not hasattr(gen_efficientnet, name):
+if hasattr(gen_efficientnet, name):
+    model_cls = getattr(gen_efficientnet, name)
+elif hasattr(gen_overall_model, name):
+    model_cls = getattr(gen_overall_model, name)
+elif hasattr(models, name):
     model_cls = getattr(models, name)
 else:
-    model_cls = getattr(gen_efficientnet, name)
-    
-net = model_cls(pretrained=True)
+    raise Exception()
+
+# net = model_cls(pretrained=True)
+net = model_cls(pretrained=False)
 net.eval()
 inputs = Variable(torch.ones([1, 3, 224, 224]))
 pytorch_to_caffe.trans_net(net, inputs, name)
