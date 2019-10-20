@@ -9,6 +9,7 @@ import shutil
 # os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
 sys.path.insert(0, ".")
 sys.path.insert(0, "/home/foxfi/projects/lpcvc/gen-efficientnet-pytorch")
+sys.path.insert(0, "/home/foxfi/projects/lpcvc/ProxylessNAS")
 
 # The caffe used for deephi_fix conflicts with the one used for PytorchToCaffe
 # sys.path.insert(0, "/home/foxfi/projects/caffe_dev/python/")
@@ -18,11 +19,10 @@ from torch.autograd import Variable
 
 import pytorch_to_caffe
 import gen_efficientnet
+import proxyless_nas
 from nxmodel import gen_overall_model
 
 from torchvision import models
-
-calib_iter = 1
 
 data_input_str = """
 
@@ -111,6 +111,8 @@ def run_pytorch_to_caffe(name, output_dir, pretrained=True, input_size=224, debu
         model_cls = getattr(gen_efficientnet, name)
     elif hasattr(gen_overall_model, name):
         model_cls = getattr(gen_overall_model, name)
+    elif hasattr(proxyless_nas, name):
+        model_cls = getattr(proxyless_nas, name)
     elif hasattr(models, name):
         model_cls = getattr(models, name)
     else:
@@ -160,7 +162,8 @@ if __name__ == "__main__":
     parser.add_argument("--input-size", default=224, type=int)
     # caffe fix
     parser.add_argument("--gpu", default="0")
-    parser.add_argument("--calib-iter", default=100, type=int)
+    # parser.add_argument("--calib-iter", default=100, type=int)
+    parser.add_argument("--calib-iter", default=0, type=int)
     # dnnc
     parser.add_argument("--dcf", default="/home/foxfi/projects/lpcvc/PytorchToCaffe/converted_results/mnasnet_100/Ultra96.dcf")
     parser.add_argument("--mode", choices=["normal", "debug"], default="debug")
@@ -211,7 +214,7 @@ if __name__ == "__main__":
             sys.exit(0)
 
         # dnnc
-        dnnc_out_dir = os.path.join(out_dir, "dnnc")
+        dnnc_out_dir = os.path.join(out_dir, "dnnc_{}".format(args.mode))
         if args.begin_stage <= 2:
             output_elf = run_dnnc(args.net, proto, model, dnnc_out_dir, args.dcf, args.mode, debug=args.debug)
         else:

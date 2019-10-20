@@ -95,9 +95,14 @@ class Layer_param():
                 pool_param.pad=pad
         self.param.pooling_param.CopyFrom(pool_param)
 
-    def batch_norm_param(self,use_global_stats=0,moving_average_fraction=None,eps=None):
-        bn_param=pb.BatchNormParameter()
-        bn_param.use_global_stats=use_global_stats
+    def batch_norm_param(self,use_global_stats=None,moving_average_fraction=None,eps=None):
+        bn_param=pb.BatchNormParameter(
+            # Not supported in this version's caffe
+            # scale_filler=pb.FillerParameter(type="constant", value=1),
+            # bias_filler=pb.FillerParameter(type="constant", value=0)
+        )
+        if use_global_stats is not None:
+            bn_param.use_global_stats = use_global_stats
         if moving_average_fraction:
             bn_param.moving_average_fraction=moving_average_fraction
         if eps:
