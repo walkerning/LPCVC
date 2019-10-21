@@ -157,6 +157,7 @@ if __name__ == "__main__":
     parser.add_argument("--begin-stage", default=0, type=int)
     parser.add_argument("--end-stage", default=2, type=int)
     parser.add_argument("--debug", default=False, action="store_true")
+    parser.add_argument("--base-result-dir", default="./elf_results")
     # pytorch to caffe
     parser.add_argument("--no-pretrained", default=False, action="store_true")
     parser.add_argument("--input-size", default=224, type=int)
@@ -174,7 +175,7 @@ if __name__ == "__main__":
         print("Can use `--debug` mode to print out detailed infos when encountering any errror")
 
     dir_name = args.dir if args.dir is not None else args.net
-    out_dir = os.path.join("elf_results/{}".format(dir_name))
+    out_dir = os.path.join(args.base_result_dir, dir_name)
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
 

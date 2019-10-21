@@ -2,9 +2,11 @@
 """
 Generate the overall model that covers the whole search space
 """
+import re
 import sys
 import copy
 from collections import namedtuple, OrderedDict
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -18,12 +20,13 @@ def namedtuple_with_defaults(name, fields, defaults):
     return type_
 
 SearchSpaceCfg = namedtuple_with_defaults("SearchSpaceCfg", ['stem_channel', 'stem_stride', 'stage_strides', 'stage_channels', 'expansions', 'kernel_sizes', 'block_args'], [{}])
-
+NetCfg = namedtuple_with_defaults('NetCfg', ['stem_channel', 'stem_stride', 'spec', 'block_args'], [{}])
+    
 def _get_divisible_by(num, divisible_by, min_val=None):
     if min_val is None:
         min_val = divisible_by
     ret = int(num)
-    if divisible_by > 0 and num % divisible_by != 0:
+    if divisible_by is not None and divisible_by > 0 and num % divisible_by != 0:
         ret = int((_py2_round(num / divisible_by) or min_val) * divisible_by)
     return ret
 
@@ -32,7 +35,7 @@ class NxBlock(nn.Module):
     postrelu/prerelu对latency有没有区别
     会不会pre_relu (conv bn relu add) 比 (conv bn add relu) 要快, 虽然少做了一个relu? 因为会fuse? 试一下
     """
-    def __init__(self, C_in, C_out, kernel_size, stride, expansion, bn=True, res_type="Ck_C1", depth_divisible=8, pre_relu=True, stride_skip=True, use_final_relu=False, use_depthwise=True):
+    def __init__(self, C_in, C_out, kernel_size, stride, expansion, bn=True, res_type="Ck_C1", depth_divisible=8, pre_relu=True, stride_skip=True, use_final_relu=False, use_depthwise=True, force_no_skip=False, force_inner_channel=None):
         assert res_type in {"Ck_C1", "k_C1", "skip"} #, "factorized", ""}
         # factorized: stride=1, C1; stride>1, factorized reduce (add of two shifted C1; seems like dpu do not support  this)
         if res_type == "skip" and (stride > 1 or C_out != C_in):
@@ -44,10 +47,14 @@ class NxBlock(nn.Module):
         self.use_depthwise = use_depthwise
         self.use_final_relu = use_final_relu
         self.pre_relu = pre_relu
-        self.has_residual = stride_skip or (stride == 1 and C_out == C_in)
+        self.has_residual = not force_no_skip and (stride_skip or (stride == 1 and C_out == C_in))
 
-        inner_dim = int(C_in * expansion)
-        inner_dim = _get_divisible_by(inner_dim, depth_divisible, depth_divisible)
+        if not force_inner_channel:
+            inner_dim = int(C_in * expansion)
+            inner_dim = _get_divisible_by(inner_dim, depth_divisible, depth_divisible)
+        else:
+            inner_dim = force_inner_channel
+        self.inner_dim = inner_dim
         if pre_relu and self.use_final_relu:
             self.opa = nn.Sequential(
                 nn.Conv2d(C_in, inner_dim, 1, stride=1, padding=0, bias=bias_flag),
@@ -162,6 +169,7 @@ mnasnet_cfg = SearchSpaceCfg(
     # inverted residual config
     block_args={"stride_skip": False, "use_depthwise": True, "res_type": "skip", "use_final_relu": False, "depth_divisible": 8}
 )
+    
 fbnetc_cfg = SearchSpaceCfg(
     stem_channel=16,
     stem_stride=2,
@@ -202,6 +210,7 @@ class View(nn.Module):
 
 def generate_overall_model(cfg, transition_block_cfg, input_size=224, num_features=1280, num_classes=1000,
                            override_block_cfgs={}, override_expansions=[], override_kernels=[]):
+    # overall across expansions/kernels
     if override_block_cfgs:
         cfg = copy.deepcopy(cfg)
         cfg.block_args.update(override_block_cfgs)
@@ -256,6 +265,81 @@ def generate_overall_model(cfg, transition_block_cfg, input_size=224, num_featur
     ]
     return nn.Sequential(OrderedDict(blocks))
 
+mnasnet_cff_cfg = NetCfg(
+    stem_channel=32,
+    stem_stride=2,
+    spec=[
+        ["c16_e3_k1_s1_noskip"],
+        ["c24_e3_k3_s2", "c24_e3_k3_s1", "c24_e3_k3_s1"],
+        ["c40_e3_k5_s2", "c40_e3_k5_s1", "c40_e3_k5_s1"],
+        ["c80_e6_k5_s2", "c80_e6_k5_s1", "c80_e6_k5_s1"],
+        ["c96_e6_k3_s1", "c96_e6_k3_s1"],
+        # ["c192_e6_k5_s2", "c192_e6_k5_s1", "c192_e6_k5_s1", "c192_e6_k5_s1"],
+        ["c192_e6_k5_s2", "c192_dc808_k5_s1", "c192_dc808_k5_s1", "c192_dc808_k5_s1"],
+        ["c320_e6_k3_s1_noskip"]
+    ],
+    # inverted residual config
+    block_args={"stride_skip": False, "use_depthwise": True, "res_type": "skip", "use_final_relu": False, "depth_divisible": 8}
+)
+
+def generate_net(cfg, input_size=224, num_features=1280, num_classes=1000):
+    # for asp dac ss, try pre relu and post relu
+    blocks = []
+    blocks.append(("stem", nn.Sequential(
+        nn.Conv2d(3, cfg.stem_channel, 3, stride=cfg.stem_stride, padding=1, bias=False),
+        nn.BatchNorm2d(cfg.stem_channel),
+        nn.ReLU(inplace=False))))
+    C_in = cfg.stem_channel
+    spatial_size = input_size / cfg.stem_stride
+    for stage_i, stage_spec in enumerate(cfg.spec):
+        for block_i, spec in enumerate(stage_spec):
+            ops = spec.split("_")
+            force_no_skip = False
+            force_inner_channel = None
+            C_out = None
+            expansion = None
+            stride = 1
+            kernel_size = None
+            for op in ops:
+                if op == "noskip":
+                    force_no_skip = True
+                elif op.startswith("c"):
+                    C_out = int(op[1:])
+                elif op.startswith("e"):
+                    expansion = int(op[1:])
+                elif op.startswith("k"):
+                    kernel_size = int(op[1:])
+                elif op.startswith("s"):
+                    stride = int(op[1:])
+                elif op.startswith("dc"):
+                    force_inner_channel = int(op[2:])
+            # transition block
+            block_cfg = copy.deepcopy(cfg.block_args)
+            block_cfg.update({
+                "C_in": C_in,
+                "C_out": C_out,
+                "stride": stride,
+                "expansion": expansion,
+                "kernel_size": kernel_size,
+                "force_no_skip": force_no_skip,
+                "force_inner_channel": force_inner_channel
+            })
+            trans_block = NxBlock(**block_cfg)
+            blocks.append(("s{}-{}_c{}-{}-{}_s{}".format(stage_i, block_i, C_in, trans_block.inner_dim, C_out, stride), trans_block))
+            spatial_size /= stride
+            C_in = C_out
+
+    print("Global avg pool size: ", spatial_size)
+    blocks = blocks + [
+        ("conv_head", nn.Conv2d(C_in, num_features, 1, stride=1, padding=0, bias=False)),
+        ("conv_head_bn", nn.BatchNorm2d(num_features)),
+        ("avg_pool", nn.AvgPool2d(kernel_size=(int(spatial_size)))),
+        ("view", View()),
+        ("classifier", nn.Linear(num_features, num_classes))
+    ]
+    return nn.Sequential(OrderedDict(blocks))
+    
+    
 trans_3_3 = {
     "kernel_size": 3,
     "expansion": 3
@@ -304,3 +388,106 @@ def overall_mnasnet_trans33_nodepthwise_e13_k3(pretrained=False):
 def overall_mnasnet_trans33_skipCkC1(pretrained=False):
     assert not pretrained
     return generate_using_trans_block(trans_3_3, mnasnet_cfg, override_block_cfgs={"res_type": "Ck_C1"})
+
+def mnasnet_100_cff_gen(pretrained=False):
+    assert not pretrained # todo, can add this pretrained
+    return generate_net(mnasnet_cff_cfg)
+
+def mnasnet_100_cff_gen_numfeatures(num_features, pretrained=False):
+    assert not pretrained # todo, can add this pretrained
+    return generate_net(mnasnet_cff_cfg, num_features=num_features)
+
+def mnasnet_100_cff_192_gen(pretrained=False):
+    assert not pretrained # todo, can add this pretrained
+    return generate_net(mnasnet_cff_cfg, input_size=6*32)
+
+def mnasnet_100_cff_cs_gen(pretrained=False):
+    assert not pretrained # todo, can add this pretrained
+    return generate_net(mnasnet_cff_cfg)
+
+def _generate_mnasnet_using_cfg(cfg, pretrained=False):
+    assert not pretrained
+    return generate_net(cfg)
+
+def _produce_num_features():
+    num_features = [900, 1000, 1100, 1200, 1280]
+    for num_feature in num_features:
+        n = num_features
+        globals()["mnasnet_100_cff_gen_numfeatures_{}".format(num_feature)] = partial(mnasnet_100_cff_gen_numfeatures, num_features=n)
+_produce_num_features()
+
+mnasnet_cff_1b_nodepthdivisible_cfg = NetCfg(
+    stem_channel=32,
+    stem_stride=2,
+    spec=[
+        ["c16_e3_k1_s1_noskip"],
+        ["c24_e3_k3_s2", "c24_e3_k3_s1"],
+        ["c40_e3_k5_s2", "c40_e3_k5_s1"],
+        ["c80_e6_k5_s2", "c80_e6_k5_s1"],
+        ["c96_e6_k3_s1", "c96_e6_k3_s1"],
+        ["c192_e6_k5_s2", "c192_dc808_k5_s1"],
+        ["c320_e6_k3_s1_noskip"]
+    ],
+    # inverted residual config
+        block_args={"stride_skip": False, "use_depthwise": True, "res_type": "skip", "use_final_relu": False, "depth_divisible": None}
+)
+def _produce_inner_channels():
+    # will all change into using `force_inner_channel`
+    channel_model_dct = {}
+    for i, modifs in enumerate([
+            None,
+            [36, 43, 50, 58, 60, 65, 70, 72, 76, 80],
+            [60, 72, 84, 96, 100, 108, 110, 120, 130, 140],
+            [240, 290, 336, 380, 400, 420, 432, 440, 460, 480, 500],
+            [290, 300, 345, 400, 460, 520, 540, 560, 570, 576, 580, 600],
+            # [[1152, 1150, 1100, 1050, 1000], [808, 800, 750, 690, 640, 580]],
+            [[580, 576, 520, 460, 400, 350, 290], [808, 800, 750, 690, 640, 580]],
+            [1920, 1830, 1730, 1640, 1540, 1440, 1340, 1240, 1150]
+    ]):
+        if modifs is None:
+            continue
+        if isinstance(modifs[0], (list, tuple)):
+            assert len(modifs) == len(cfg.spec[i])
+            for block_i, new_cs in enumerate(modifs):
+                for new_c in new_cs:
+                    cfg = copy.deepcopy(mnasnet_cff_1b_nodepthdivisible_cfg)
+                    cfg.spec[i][block_i] = re.sub("(dc|e)\d+_", "dc{}_".format(new_c), cfg.spec[i][block_i])
+                    # if "dc" in cfg.spec[i][block_i]:
+                    #     cfg.spec[i][block_i] = re.sub("dc\d+_", "dc{}_".format(new_c), cfg.spec[i][block_i])
+                    # else:
+                    #     assert "e" in cfg.spec[i][block_i]
+                    #     cfg.spec[i][block_i] = re.sub("e\d+_", "dc{}_".format(new_c), cfg.spec[i][block_i])
+                    channel_model_dct["mnasnet_100_cff_1b_gen_numic_stage{}_b{}_{}".format(i, block_i, new_c)] = partial(_generate_mnasnet_using_cfg, cfg=cfg)
+        else:
+            for new_c in modifs:
+                cfg = copy.deepcopy(mnasnet_cff_1b_nodepthdivisible_cfg)
+                cfg.spec[i] = [re.sub("(dc|e)\d+_", "dc{}_".format(new_c), str_) for str_ in cfg.spec[i]]
+                channel_model_dct["mnasnet_100_cff_1b_gen_numic_stage{}_{}".format(i, new_c)] = partial(_generate_mnasnet_using_cfg, cfg=cfg)
+    return channel_model_dct
+
+inner_channel_model_dct = _produce_inner_channels()
+globals().update(inner_channel_model_dct)
+
+def _produce_channels():
+    # still repspect expansion
+    channel_model_dct = {}
+    for i, modifs in enumerate([
+            None,
+            [16, 18, 20, 24, 28, 30, 34],
+            [30, 35, 40, 45, 50],
+            [60, 70, 75, 80, 85, 90],
+            [70, 80, 86, 90, 92, 96, 100, 104, 110],
+            [180, 186, 190, 192, 196, 200, 204, 210],
+            [280, 300, 320]]
+    ):
+        if modifs is None:
+            continue
+        for new_c in modifs:
+            cfg = copy.deepcopy(mnasnet_cff_1b_nodepthdivisible_cfg)
+            cfg.spec[i] = [re.sub("^c\d+_", "c{}_".format(new_c), str_) for str_ in cfg.spec[i]]
+            channel_model_dct["mnasnet_100_cff_1b_gen_numc_stage{}_{}".format(i, new_c)] = partial(_generate_mnasnet_using_cfg, cfg=cfg)
+    return channel_model_dct
+
+channel_model_dct = _produce_channels()
+globals().update(channel_model_dct)
+

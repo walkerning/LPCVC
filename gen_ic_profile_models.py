@@ -1,0 +1,54 @@
+import subprocess
+from nxmodel import gen_overall_model
+generated_str = """
+mnasnet_100_cff_1b_gen_numic_stage1_36
+mnasnet_100_cff_1b_gen_numic_stage1_43
+mnasnet_100_cff_1b_gen_numic_stage1_50
+mnasnet_100_cff_1b_gen_numic_stage1_58
+mnasnet_100_cff_1b_gen_numic_stage1_60
+mnasnet_100_cff_1b_gen_numic_stage1_65
+mnasnet_100_cff_1b_gen_numic_stage1_70
+mnasnet_100_cff_1b_gen_numic_stage1_72
+mnasnet_100_cff_1b_gen_numic_stage1_76
+mnasnet_100_cff_1b_gen_numic_stage1_80
+mnasnet_100_cff_1b_gen_numic_stage2_60
+mnasnet_100_cff_1b_gen_numic_stage2_72
+mnasnet_100_cff_1b_gen_numic_stage2_84
+mnasnet_100_cff_1b_gen_numic_stage2_96
+mnasnet_100_cff_1b_gen_numic_stage2_100
+mnasnet_100_cff_1b_gen_numic_stage2_108
+mnasnet_100_cff_1b_gen_numic_stage2_110
+mnasnet_100_cff_1b_gen_numic_stage2_120
+mnasnet_100_cff_1b_gen_numic_stage2_130
+mnasnet_100_cff_1b_gen_numic_stage2_140
+mnasnet_100_cff_1b_gen_numic_stage3_240
+mnasnet_100_cff_1b_gen_numic_stage3_290
+mnasnet_100_cff_1b_gen_numic_stage3_336
+mnasnet_100_cff_1b_gen_numic_stage3_380
+mnasnet_100_cff_1b_gen_numic_stage3_400
+mnasnet_100_cff_1b_gen_numic_stage3_420
+mnasnet_100_cff_1b_gen_numic_stage3_432
+mnasnet_100_cff_1b_gen_numic_stage3_440
+mnasnet_100_cff_1b_gen_numic_stage3_460
+mnasnet_100_cff_1b_gen_numic_stage3_480
+mnasnet_100_cff_1b_gen_numic_stage3_500
+mnasnet_100_cff_1b_gen_numic_stage4_290
+mnasnet_100_cff_1b_gen_numic_stage4_300
+mnasnet_100_cff_1b_gen_numic_stage4_345
+mnasnet_100_cff_1b_gen_numic_stage4_400
+mnasnet_100_cff_1b_gen_numic_stage4_460
+mnasnet_100_cff_1b_gen_numic_stage4_520
+mnasnet_100_cff_1b_gen_numic_stage4_540
+mnasnet_100_cff_1b_gen_numic_stage4_560
+mnasnet_100_cff_1b_gen_numic_stage4_570
+mnasnet_100_cff_1b_gen_numic_stage4_576
+mnasnet_100_cff_1b_gen_numic_stage4_580
+mnasnet_100_cff_1b_gen_numic_stage4_600
+"""
+names = generated_str.strip().split("\n")
+for key in gen_overall_model.inner_channel_model_dct.keys():
+    if key in names:
+        print("Skip already generated {}".format(key))
+        continue
+    print("Generate {}".format(key))
+    subprocess.check_call("python gen_elf.py --base-result-dir ./elf_results/ic_profile_models/ -n {} --calib-iter 0 --mode debug --no-pretrained --debug >/dev/null 2>&1".format(key), shell=True)
