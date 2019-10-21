@@ -1,6 +1,8 @@
 import subprocess
 from nxmodel import gen_overall_model
-generated_str = """
+generated_str = ""
+
+"""
 mnasnet_100_cff_1b_gen_numic_stage1_36
 mnasnet_100_cff_1b_gen_numic_stage1_43
 mnasnet_100_cff_1b_gen_numic_stage1_50
@@ -45,10 +47,11 @@ mnasnet_100_cff_1b_gen_numic_stage4_576
 mnasnet_100_cff_1b_gen_numic_stage4_580
 mnasnet_100_cff_1b_gen_numic_stage4_600
 """
+
 names = generated_str.strip().split("\n")
 for key in gen_overall_model.inner_channel_model_dct.keys():
     if key in names:
         print("Skip already generated {}".format(key))
         continue
     print("Generate {}".format(key))
-    subprocess.check_call("python gen_elf.py --base-result-dir ./elf_results/ic_profile_models/ -n {} --calib-iter 0 --mode debug --no-pretrained --debug >/dev/null 2>&1".format(key), shell=True)
+    subprocess.check_call("python gen_elf.py --base-result-dir ./elf_results/ic_profile_models_new/ -n {} --calib-iter 0 --mode debug --no-pretrained --debug >/dev/null 2>&1".format(key), shell=True)
