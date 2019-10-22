@@ -40,13 +40,13 @@ def construct_lp(accs, latencys, stage_names, upper_bounds_dct={}):
     La = []
     LW = []
     for n, (c, l) in zip(stage_names, latencys):
-        slope, _, r_value, _, _ = scipy.stats.linregress(x=c, y=l)
-        # print("{}: LW {} ;  r-squared {}".format(n, slope, r_value ** 2))
+        slope, inter, r_value, _, _ = scipy.stats.linregress(x=c, y=l)
+        print("{}: LW {} ; intersect: {}; r-squared {}".format(n, slope, inter, r_value ** 2))
         LW.append(slope)
 
     for n, (c, l) in zip(stage_names, accs):
         slope, _, r_value, _, _ = scipy.stats.linregress(x=c, y=l)
-        # print("{}: LA {} ;  r-squared {}".format(n, slope, r_value ** 2))
+        print("{}: LA {} ; r-squared {}".format(n, slope, r_value ** 2))
         LA.append(slope)
     for n in stage_names:
         if n in upper_bounds_dct:
@@ -123,8 +123,8 @@ def extract_latency(dir_, use_ratio=False):
         results.append((stage, block, c, block_latency))
     
     results = sorted(results)
-    # for res in results:
-    #     print("stage {} block {} c {}: {:.2f} ms".format(*res))
+    for res in results:
+        print("stage {} block {} c {}: {:.2f} ms".format(*res))
     stage_perfs = [None] + [defaultdict(list) for _ in range(6)]
     [stage_perfs[res[0]][res[1]].append(res[2:]) for res in results]
     # ori_inner_c = [None, [48, 72], [72, 120], [240, 480], [480, 576], [576, 808], [1152]]
@@ -248,48 +248,62 @@ plot_cs(accs, latencys, title="profile", x_lim=[0.1, 1.0])
 
 def find_inflection(accs, all_stage_names):
     inflections = []
+    points = []
     for i, (item, name) in enumerate(zip(accs, all_stage_names)):
         cs, s_accs = np.array(item)
         grad = (s_accs[:-1] - s_accs[1:]) / (cs[:-1] - cs[1:])
         for i in range(1, len(grad)):
             if (grad[i] > np.max(grad[:i]) * 2 and grad[i] > 0.3) or grad[i] > 0.5:
                 inf = 1.0 - cs[i]
+                points.append(i+1)
                 break
         else:
             inf = 0.9
+            points.append(len(grad) + 1)
         inflections.append(inf)
-    return inflections
+    return inflections, points
 
-inflections = find_inflection(sum(accs, []), all_stage_names)
-# print("--- inflections ---")
-# pprint.pprint(list(zip(all_stage_names, all_conv_names, inflections)))
+all_accs = sum(accs, [])
+all_latencys = sum(latencys, [])
 
-LA, Ua, La, LW = construct_lp(sum(accs, []), sum(latencys, []), sum(stage_names, []), upper_bounds_dct=dict(zip(all_stage_names, inflections)))
+inflections, points = find_inflection(all_accs, all_stage_names)
+print("--- inflections ---")
+for s_name, c_name, inf in zip(all_stage_names, all_conv_names, inflections):
+    print("{} {} {:.3f}".format(s_name, c_name, inf))
+
+INCLUDE_ALL_POINTS = False
+if not INCLUDE_ALL_POINTS:
+    for i, p in enumerate(points):
+        all_accs[i] = [all_accs[i][0][:p], all_accs[i][1][:p]]
+
+LA, Ua, La, LW = construct_lp(all_accs, all_latencys, sum(stage_names, []), upper_bounds_dct=dict(zip(all_stage_names, inflections)))
 current = 6.9 + 3 * 0.3 * LW[-2]
 def generate_spec_for_target_latency(target):
     print("Generating pruning spec for target latency: {}".format(target))
     L_target = current - target
     res = solve_lp(LA, Ua, La, LW, L_target)
+    print("lp res:", res)
     block_alphas = res.x
     print("--- block reduce alphas ---")
     prune_spec = list(zip(all_stage_names, all_conv_names, block_alphas))
     pprint.pprint(prune_spec)
     
-    GAMMA = 1.2
-    weight = (np.array(LW) / LA) ** GAMMA
-    w = weight / np.sum(weight)
-    coeff = L_target / (w * LW).sum()
-    block_alphas_2 = coeff * w
-    
+    # GAMMA = 1.2
+    # weight = (np.array(LW) / LA) ** GAMMA
+    # w = weight / np.sum(weight)
+    # coeff = L_target / (w * LW).sum()
+    # block_alphas_2 = coeff * w
     # print("--- block reduce alphas 2 ---")
     # pprint.pprint(list(zip(all_stage_names, all_conv_names, block_alphas_2)))
     
     # alpha should have sparsity? no
     # both sensitivity analyse acc curve and train acc curve might be a S-shape curve from [0, 1] to [0, acc_ori]; family of s-shape functions (cdfs of [0, 1] distributed r.vs / sigmoid to approximate)
-    # convex optimization: need acc correction. s-shape function
+    # convex optimization: need acc correction. s-shape function family (cdf of beta distribution, parametrized by alpha, beta)
     
     net_prune_message = cpp.NetPruningParameter()
     for _, name, ratio in prune_spec:
+        # if ratio < 1e-4:
+        #     continue
         layer_spec = cpp.LayerPruningParameter(rate=ratio)
         layer_spec.ClearField("layer_top")
         layer_spec.layer_top.append("conv_blob" + name.strip("conv"))
@@ -297,7 +311,11 @@ def generate_spec_for_target_latency(target):
     fname = "pruning_target_{}.prototxt".format(target)
     with open(fname, "w") as wf:
         wf.write(text_format.MessageToString(net_prune_message))
-    print("current latency: {}; target latency: {}; approx acc sensitivty decrease: {}; saved into {}".format(current, target, (block_alphas * LA).sum(), fname))
+    print("LP success: {}; current latency: {}; target latency: {}; approx acc sensitivty decrease: {}; saved into {}".format(
+        "{} {}".format(res.success, res.slack[0]) if not res.success else res.success,
+        current, target, (block_alphas * LA).sum(), fname))
+    print("block alphas: [{}]".format(", ".join(["{:.2f}".format(r) for r in block_alphas])))
+
 generate_spec_for_target_latency(6)
 generate_spec_for_target_latency(5)
 generate_spec_for_target_latency(4)
