@@ -188,8 +188,7 @@ def extract_acc(ana_file, prototxt):
             all_sep_conv_chs.append(l.convolution_param.num_output)
 
     # inner depthwise channel number organized by stages
-    stage_inner_cs = [None]
-    i_all_sep_conv_chs = 0
+    stage_inner_cs = [None] + _organize_as_stages(all_sep_conv_chs, stage_blocks[1:])
     c_range = list(np.arange(1.0, 0, -0.1))
     # the sensitivity acc lists of depthwise convs, organized by stages
     stage_accs = [None] + [[] for _ in range(6)]
@@ -197,14 +196,15 @@ def extract_acc(ana_file, prototxt):
         for block_i, conv_id in enumerate(stage_sepconvs[stage_i]):
             blob_name = "conv_blob{}".format(conv_id)
             stage_accs[stage_i].append([c_range, sensitive_dict[blob_name]])
-        stage_inner_cs.append(all_sep_conv_chs[i_all_sep_conv_chs:i_all_sep_conv_chs + stage_blocks[stage_i]])
-        i_all_sep_conv_chs += stage_blocks[stage_i]
     return stage_accs, stage_inner_cs
 
 def fit(data):
     pass
 
-def plot_cs(output_file, acc_data, latency_data, title="", x_lim=None, acc_ylim=None, latency_ylim=None):
+def plot_cs(output_file, acc_data, latency_data, inflection_data,
+            title="", x_lim=None, acc_ylim=None, latency_ylim=None):
+    # plots every row is the anas of convs in one stage
+    # column 1 is acc plots, column 2 is latency plots
     assert len(acc_data) == len(latency_data)
     num_rows = len(acc_data)
     num_cols = 2
@@ -223,12 +223,16 @@ def plot_cs(output_file, acc_data, latency_data, title="", x_lim=None, acc_ylim=
             num_conv = (sum(stage_blocks[1:1+stage_i]) + block_i) * 3 + 5
             label = "stage {} block {} conv{}".format(stage_i+1, block_i, num_conv)
             labels.append(label)
-            handles.append(ax.plot(block_data[0], block_data[1], label=label)[0])
+            h_ = ax.plot(block_data[0], block_data[1], label=label)[0]
+            handles.append(h_)
+            ax.plot([1 - inflection_data[stage_i][block_i]+(np.random.rand()-0.5)*0.01] * 2,
+                    [0, 1 + (np.random.rand()-0.5)*0.5], color=h_.get_color(), alpha=0.5,
+                    linewidth=1) # plot inflection vertical line
             c_values_1.update(block_data[0])
             acc_values.update(block_data[1])
         ax.set_title("acc")
         ax.set_xticks(sorted(list(c_values_1)), minor=True)
-        ax.set_yticks(sorted(list(acc_values)))#, minor=True)
+        ax.set_yticks(sorted(list(acc_values)))
         if acc_ylim:
             ax.set_ylim(acc_ylim)
         if x_lim:
@@ -237,12 +241,15 @@ def plot_cs(output_file, acc_data, latency_data, title="", x_lim=None, acc_ylim=
         for block_i, block_data in enumerate(stage_latency_data):
             num_conv = (sum(stage_blocks[1:1+stage_i]) + block_i) * 3 + 5
             label = "stage {} block {} conv{}".format(stage_i+1, block_i, num_conv)
-            ax.plot(block_data[0], block_data[1], label=label)
+            h_ = ax.plot(block_data[0], block_data[1], label=label)[0]
+            ax.plot([1- inflection_data[stage_i][block_i]+(np.random.rand()-0.5)*0.01] * 2,
+                    [0, 0.5 + (np.random.rand()-0.5)*0.25], c=h_.get_color(), alpha=0.5,
+                    linewidth=1) # plot inflection vertical line
             c_values_2.update(block_data[0])
             l_values.update(block_data[1])
         ax.set_title("latency")
         ax.set_xticks(sorted(list(c_values_2)), minor=True)
-        ax.set_yticks(sorted(list(l_values)))#, minor=True)
+        ax.set_yticks(sorted(list(l_values)))
         if latency_ylim:
             ax.set_ylim(latency_ylim)
         if x_lim:
@@ -310,6 +317,15 @@ def generate_spec_for_targetdiff_latency(LA, Ua, La, LW, target, out_fname):
         "{} {}".format(res.success, res.slack[0]) if not res.success else res.success,
         target, (block_alphas * LA).sum(), out_fname))
     print("block alphas: [{}]".format(", ".join(["{:.2f}".format(r) for r in block_alphas])))
+    print("constraint  : [{}]".format(", ".join(["{:.2f}".format(u) for u in Ua])))
+
+def _organize_as_stages(flatten_lst, stage_nums):
+    i = 0
+    stage_lst = []
+    for num in stage_nums:
+        stage_lst.append(flatten_lst[i:i + num])
+        i += num
+    return stage_lst
 
 def main(analyse_file, prototxt, target, output_dir, ori_808):
     accs, ori_inner_c = extract_acc(analyse_file, prototxt)
@@ -325,8 +341,6 @@ def main(analyse_file, prototxt, target, output_dir, ori_808):
     # we do not process the first stage of mnasnet meta architecture
     latencys = latencys[1:]
     accs = accs[1:]
-    # save the plot of acc sensitity, latency respect to relative channels
-    plot_cs(os.path.join(output_dir, "plot.pdf"), accs, latencys, title="profile", x_lim=[0.1, 1.0])
 
     all_accs = sum(accs, [])
     all_latencys = sum(latencys, [])
@@ -338,7 +352,12 @@ def main(analyse_file, prototxt, target, output_dir, ori_808):
     for s_name, c_name, inf in zip(all_stage_names, all_conv_names, inflections):
         print("{} {} {:.3f}".format(s_name, c_name, inf))
 
-    INCLUDE_ALL_POINTS = False
+    # save the plot of acc sensitity, latency respect to relative channels
+    # also the inflection points are ploted
+    plot_cs(os.path.join(output_dir, "plot.pdf"), accs, latencys, _organize_as_stages(inflections, stage_blocks[1:]),
+            title="profile", x_lim=[0.1, 1.0])
+
+    INCLUDE_ALL_POINTS = False # DO NOT include all points!
     if not INCLUDE_ALL_POINTS:
         for i, p in enumerate(points):
             all_accs[i] = [all_accs[i][0][:p], all_accs[i][1][:p]]
