@@ -4,9 +4,11 @@
 import re
 import sys
 import os
-import numpy as np
+import argparse
 import pprint
 from collections import defaultdict
+
+import numpy as np
 
 import scipy
 from scipy.optimize import linprog
@@ -27,7 +29,7 @@ from caffe.proto import caffe_pb2 as cp
 from caffe.proto import pruning_pb2 as cpp
 from google.protobuf import text_format
 
-def construct_lp(accs, latencys, stage_names, upper_bounds_dct={}):
+def construct_lp(accs, latencys, stage_names, ori_808, upper_bounds_dct={}):
     assert len(accs) == len(latencys) == len(stage_names)
     # all as: a >= 0, a <= 0.9 (根据每个的acc降低拐点情况定一个区间...不能只是小于0.9)
     # a_51 >= 0.3
@@ -39,10 +41,12 @@ def construct_lp(accs, latencys, stage_names, upper_bounds_dct={}):
     Ua = []
     La = []
     LW = []
+    Lb = []
     for n, (c, l) in zip(stage_names, latencys):
         slope, inter, r_value, _, _ = scipy.stats.linregress(x=c, y=l)
         print("{}: LW {} ; intersect: {}; r-squared {}".format(n, slope, inter, r_value ** 2))
         LW.append(slope)
+        Lb.append(inter)
 
     for n, (c, l) in zip(stage_names, accs):
         slope, _, r_value, _, _ = scipy.stats.linregress(x=c, y=l)
@@ -51,15 +55,16 @@ def construct_lp(accs, latencys, stage_names, upper_bounds_dct={}):
     for n in stage_names:
         if n in upper_bounds_dct:
             Ua.append(upper_bounds_dct[n])
-        elif n.endswith("0"):
-            Ua.append(0.5)
+        # elif n.endswith("0"):
+        #     Ua.append(0.5)
         else:
             Ua.append(0.9)
-        if n not in {"5-1", "5-2", "5-3"}:
-            La.append(0)
-        else:
+        if n in {"5-1", "5-2", "5-3"} and ori_808:
             La.append(0.3)
-    return LA, Ua, La, LW
+        else:
+            La.append(0)
+    # acc slope, upper bound of prune alpha/ratio, lower bound of..., latency slope, latency intersect
+    return LA, Ua, La, LW, Lb
 
 def solve_lp(LA, Ua, La, LW, L_target):
     # Ua, La, and LW a
@@ -68,7 +73,7 @@ def solve_lp(LA, Ua, La, LW, L_target):
     # call linprog
     return linprog(LA, A_ub=-np.array([LW]), b_ub=np.array([-L_target]), bounds=list(zip(La, Ua)))
         
-def extract_latency(dir_, use_ratio=False):
+def extract_latency(dir_, use_ratio=False, ratio_respect=None):
     sepconvs = [
         "conv3",
         "conv6",
@@ -128,15 +133,23 @@ def extract_latency(dir_, use_ratio=False):
     stage_perfs = [None] + [defaultdict(list) for _ in range(6)]
     [stage_perfs[res[0]][res[1]].append(res[2:]) for res in results]
     # ori_inner_c = [None, [48, 72], [72, 120], [240, 480], [480, 576], [576, 808], [1152]]
-    ori_inner_c = [None, [48, 72], [72, 120], [240, 480], [480, 576], [576, 1152], [1152]]
+    if ratio_respect is None:
+        # calculate channel ratio respect to original mnasnet
+        ori_inner_c = [None, [48, 72], [72, 120], [240, 480], [480, 576], [576, 1152], [1152]]
+    else:
+        ori_inner_c = ratio_respect
     for i in range(len(stage_perfs)):
         if stage_perfs[i] is None:
             continue
         stage_perfs[i] = {b_i: list(zip(*list(reversed(stage_perfs[i][b_i])))) for b_i in stage_perfs[i]}
-        if use_ratio:
-            for b_i in stage_perfs[i]:
-                stage_perfs[i][b_i][0] = list(np.array(stage_perfs[i][b_i][0])/float(ori_inner_c[i][b_i]))
+        # convert to list
         stage_perfs[i] = [stage_perfs[i][b_i] for b_i in range(len(stage_perfs[i]))]
+        if use_ratio:
+            new_stage_perf = []
+            for b_i in range(len(ori_inner_c[i])):
+                block_perf = stage_perfs[i][b_i] if b_i < len(stage_perfs[i]) else stage_perfs[i][-1]
+                new_stage_perf.append((list(np.array(block_perf[0])/float(ori_inner_c[i][b_i])), block_perf[1]))
+        stage_perfs[i] = new_stage_perf
     return stage_perfs
 
 stage_blocks = [None, 3, 3, 3, 2, 4, 1]
@@ -144,7 +157,7 @@ stage_names = [[]] + [["{}-{}".format(stage_i+1, block_i) for block_i in range(n
 all_stage_names = sum(stage_names, [])
 conv_names =  [[]] + [["conv{}".format((sum(stage_blocks[1:1+stage_i]) + block_i) * 3 + 5) for block_i in range(num_block)] for stage_i, num_block in enumerate(stage_blocks[1:])]
 all_conv_names = sum(conv_names, [])
-def extract_acc(ana_file, prototxt=None):
+def extract_acc(ana_file, prototxt):
     sens_message = cpp.NetSens()
     with open(ana_file, "r") as rf:
         text_format.Merge(rf.read(), sens_message)
@@ -160,28 +173,38 @@ def extract_acc(ana_file, prototxt=None):
         sepconvs = [5 + (passed_blocks + i) * 3 for i in range(num_blocks)]
         passed_blocks += num_blocks
         stage_sepconvs.append(sepconvs)
-    if prototxt:
-        net_message = cp.NetParameter()
-        with open(prototxt, "r") as rf:
-            text_format.Merge(rf.read(), net_message)
-        all_sep_convs = set(sum(stage_sepconvs, []))
-        for l in net_message.layer:
-            if l.type == "Convolution" and int(l.name.strip("conv")) in all_sep_convs:
-                # assert is depthwise conv
-                assert l.convolution_param.group == l.convolution_param.num_output
+    # if prototxt:
+    # check the indexes we extract out are indeed sepconvs, and extract the depthwise conv channels
+    # to be used by `extract_latency`
+    net_message = cp.NetParameter()
+    with open(prototxt, "r") as rf:
+        text_format.Merge(rf.read(), net_message)
+    all_sep_convs = set(sum(stage_sepconvs, []))
+    all_sep_conv_chs = []
+    for l in net_message.layer:
+        if l.type == "Convolution" and int(l.name.strip("conv")) in all_sep_convs:
+            # assert is depthwise conv
+            assert l.convolution_param.group == l.convolution_param.num_output
+            all_sep_conv_chs.append(l.convolution_param.num_output)
 
+    # inner depthwise channel number organized by stages
+    stage_inner_cs = [None]
+    i_all_sep_conv_chs = 0
     c_range = list(np.arange(1.0, 0, -0.1))
+    # the sensitivity acc lists of depthwise convs, organized by stages
     stage_accs = [None] + [[] for _ in range(6)]
     for stage_i in range(1, 7):
         for block_i, conv_id in enumerate(stage_sepconvs[stage_i]):
             blob_name = "conv_blob{}".format(conv_id)
             stage_accs[stage_i].append([c_range, sensitive_dict[blob_name]])
-    return stage_accs
+        stage_inner_cs.append(all_sep_conv_chs[i_all_sep_conv_chs:i_all_sep_conv_chs + stage_blocks[stage_i]])
+        i_all_sep_conv_chs += stage_blocks[stage_i]
+    return stage_accs, stage_inner_cs
 
 def fit(data):
     pass
 
-def plot_cs(acc_data, latency_data, title="", x_lim=None, acc_ylim=None, latency_ylim=None):
+def plot_cs(output_file, acc_data, latency_data, title="", x_lim=None, acc_ylim=None, latency_ylim=None):
     assert len(acc_data) == len(latency_data)
     num_rows = len(acc_data)
     num_cols = 2
@@ -231,20 +254,7 @@ def plot_cs(acc_data, latency_data, title="", x_lim=None, acc_ylim=None, latency
         plt.legend(tuple(handles), labels, loc="center") # center the legends info in the subplot
     plt.suptitle(title)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig("./plot.pdf")
-
-latencys = extract_latency("./profile_results", use_ratio=True)
-for stage_i, stage_latency in enumerate(latencys):
-    if stage_latency is None:
-        continue
-    for block_i in range(len(stage_latency), stage_blocks[stage_i]):
-        latencys[stage_i].append(stage_latency[-1])
-accs = extract_acc("./ana.regular", "mnasnet_808.prototxt")
-
-latencys = latencys[1:]
-accs = accs[1:]
-plot_cs(accs, latencys, title="profile", x_lim=[0.1, 1.0])
-
+    plt.savefig(output_file)
 
 def find_inflection(accs, all_stage_names):
     inflections = []
@@ -263,24 +273,10 @@ def find_inflection(accs, all_stage_names):
         inflections.append(inf)
     return inflections, points
 
-all_accs = sum(accs, [])
-all_latencys = sum(latencys, [])
-
-inflections, points = find_inflection(all_accs, all_stage_names)
-print("--- inflections ---")
-for s_name, c_name, inf in zip(all_stage_names, all_conv_names, inflections):
-    print("{} {} {:.3f}".format(s_name, c_name, inf))
-
-INCLUDE_ALL_POINTS = False
-if not INCLUDE_ALL_POINTS:
-    for i, p in enumerate(points):
-        all_accs[i] = [all_accs[i][0][:p], all_accs[i][1][:p]]
-
-LA, Ua, La, LW = construct_lp(all_accs, all_latencys, sum(stage_names, []), upper_bounds_dct=dict(zip(all_stage_names, inflections)))
-current = 6.9 + 3 * 0.3 * LW[-2]
-def generate_spec_for_target_latency(target):
-    print("Generating pruning spec for target latency: {}".format(target))
-    L_target = current - target
+def generate_spec_for_targetdiff_latency(LA, Ua, La, LW, target, out_fname):
+    # print("Generating pruning spec for target latency: {} ms; current: {} ms".format(target, current))
+    print("Generating pruning spec for target diff latency: {} ms".format(target))
+    L_target = target
     res = solve_lp(LA, Ua, La, LW, L_target)
     print("lp res:", res)
     block_alphas = res.x
@@ -308,15 +304,75 @@ def generate_spec_for_target_latency(target):
         layer_spec.ClearField("layer_top")
         layer_spec.layer_top.append("conv_blob" + name.strip("conv"))
         net_prune_message.layer_pruning.append(layer_spec)
-    fname = "pruning_target_{}.prototxt".format(target)
-    with open(fname, "w") as wf:
+    with open(out_fname, "w") as wf:
         wf.write(text_format.MessageToString(net_prune_message))
-    print("LP success: {}; current latency: {}; target latency: {}; approx acc sensitivty decrease: {}; saved into {}".format(
+    print("LP success: {}; target diff latency: {}; approx acc sensitivty decrease: {}; saved into {}".format(
         "{} {}".format(res.success, res.slack[0]) if not res.success else res.success,
-        current, target, (block_alphas * LA).sum(), fname))
+        target, (block_alphas * LA).sum(), out_fname))
     print("block alphas: [{}]".format(", ".join(["{:.2f}".format(r) for r in block_alphas])))
 
-generate_spec_for_target_latency(6)
-generate_spec_for_target_latency(5)
-generate_spec_for_target_latency(4)
+def main(analyse_file, prototxt, target, output_dir, ori_808):
+    accs, ori_inner_c = extract_acc(analyse_file, prototxt)
+    latencys = extract_latency("./profile_results", use_ratio=True, ratio_respect=ori_inner_c)
 
+    # LEGACY: now this correction is done in the extract_latency, as ratio_repect is always provided
+    for stage_i, stage_latency in enumerate(latencys):
+        if stage_latency is None:
+            continue
+        for block_i in range(len(stage_latency), stage_blocks[stage_i]):
+            latencys[stage_i].append(stage_latency[-1])
+
+    # we do not process the first stage of mnasnet meta architecture
+    latencys = latencys[1:]
+    accs = accs[1:]
+    # save the plot of acc sensitity, latency respect to relative channels
+    plot_cs(os.path.join(output_dir, "plot.pdf"), accs, latencys, title="profile", x_lim=[0.1, 1.0])
+
+    all_accs = sum(accs, [])
+    all_latencys = sum(latencys, [])
+
+    # find the inflection points, the LP will be solved within these inflection points constraints
+    # NOTE: for now, no extrapolation to c > 1.0 is considered, but that might be interesting as well
+    inflections, points = find_inflection(all_accs, all_stage_names)
+    print("--- inflections ---")
+    for s_name, c_name, inf in zip(all_stage_names, all_conv_names, inflections):
+        print("{} {} {:.3f}".format(s_name, c_name, inf))
+
+    INCLUDE_ALL_POINTS = False
+    if not INCLUDE_ALL_POINTS:
+        for i, p in enumerate(points):
+            all_accs[i] = [all_accs[i][0][:p], all_accs[i][1][:p]]
+
+    LA, Ua, La, LW, Lb = construct_lp(all_accs, all_latencys, sum(stage_names, []), ori_808,
+                                      upper_bounds_dct=dict(zip(all_stage_names, inflections)))
+
+    # current = np.sum(LW + Lb) + time_bias # do not know this bias, as my profiling backbone was different from mnasnet100
+    # if ori_808:
+    #     # as the ori 1152 cannot be deployed onto Ultra96, the first prune iter is special,
+    #     # need manual correction here, and manually setting 0.3 prune ratio setting in construct_lp
+    #     current_cob = 6.9 + 3 * 0.3 * LW[-2]
+    #     7.19 ms
+    #     print("The corrected latency from on-board exp is {} ms".format(current_cob))
+    # print("NOTE: The estimated current latency is {} ms. PLEASE CHECK THIS IS CORRECT.".format(current))
+
+    for t in target:
+        fname = os.path.join(output_dir, "pruning_targetdiff_{}.prototxt".format(t))
+        generate_spec_for_targetdiff_latency(LA, Ua, La, LW, t, fname)
+
+        
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("ana", help="analyse file, produced by nics_compress ana")
+    parser.add_argument("proto", help="prototxt file")
+    parser.add_argument("output_dir", help="save the prune specification to this dir")
+    parser.add_argument("--not-ori-808", default=False, action="store_true")
+    parser.add_argument("-t", "--target", default=[], type=float, required=True, action="append",
+                        help="The target diff")
+    args = parser.parse_args()
+    
+    # main("./ana.regular", "mnasnet_808.prototxt")
+    # main("./prune_6_ana/ana.regular", "./prune_6_ana/transformed.prototxt")
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+    main(args.ana, args.proto, args.target, args.output_dir, not args.not_ori_808)
