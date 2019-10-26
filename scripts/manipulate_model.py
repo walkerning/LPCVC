@@ -10,8 +10,6 @@ import yaml
 import numpy as np
 from google.protobuf import text_format
 
-sys.path.insert(0, "/home/foxfi/projects/lpcvc/caffe_nics/python/")
-
 def modify_message(message, in_place, **to_modify_fields):
     if not in_place:
         new_message = message.__class__()
@@ -65,10 +63,17 @@ def merge_convs(in_proto, in_model, out_proto, out_model):
 
     # one pass through the prototxt find two consecutive 1x1 convs
     blob_producer = {}
+    actual_blob_producer = {}    
     blob_used = defaultdict(int)
     for l in old_solver.layer:
+        if l.type == "BatchNorm":
+            # blob_producer ignore batchnorm
+            blob_producer[l.top[0]] = blob_producer[l.bottom[0]]
+        else:
+            for blob_name in l.top:
+                blob_producer[blob_name] = l
         for blob_name in l.top:
-            blob_producer[blob_name] = l
+            actual_blob_producer[blob_name] = l
         for blob_name in l.bottom:
             blob_used[blob_name] += 1
     to_merge = []
@@ -82,7 +87,11 @@ def merge_convs(in_proto, in_model, out_proto, out_model):
                 continue
             last_layer = blob_producer[l.bottom[0]]
             if last_layer.type == "Convolution" and last_layer.convolution_param.kernel_size[0] == 1 and last_layer.convolution_param.group == 1 and l.convolution_param.stride[0] == 1:
-                to_merge.append((last_layer.name, l.name))
+                if actual_blob_producer[l.bottom[0]] != last_layer:
+                    # batchnorm
+                    to_merge.append((last_layer.name, l.name, actual_blob_producer[l.bottom[0]].name))
+                else:
+                    to_merge.append((last_layer.name, l.name))
     print("Layer pairs to merge: ", to_merge)
     if not to_merge:
         print("WARNING: Do not have consecutive 1x1 conv pairs to merge!")
@@ -93,12 +102,16 @@ def merge_convs(in_proto, in_model, out_proto, out_model):
     named_layers = {l.name: l for l in old_solver.layer}
     layer_lst = [l for l in old_solver.layer]
     for l_pair in to_merge:
+        if len(l_pair) == 3:
+            # has batchnorm
+            layer_lst.remove(named_layers[l_pair[2]])
         layer_1 = named_layers[l_pair[0]]
         layer_lst.remove(layer_1)
         layer_2 = named_layers[l_pair[1]]
         ind = layer_lst.index(layer_2)
         layer_lst.remove(layer_2)
-        has_bias = layer_1.convolution_param.bias_term or layer_2.convolution_param.bias_term
+        # if has bn, must has bias
+        has_bias = layer_1.convolution_param.bias_term or layer_2.convolution_param.bias_term or len(l_pair) == 3
         merged_name = layer_1.name + "_" + layer_2.name
         merged_layer_names[merged_name] = l_pair
         merged_layer = modify_message(
@@ -127,14 +140,29 @@ def merge_convs(in_proto, in_model, out_proto, out_model):
     old_params = old_net.params
     for layer_name, param in new_net.params.iteritems():
         if layer_name in merged_layer_names:
-            w_1 = old_params[merged_layer_names[layer_name][0]][0].data[:, :, 0, 0]
-            w_2 = old_params[merged_layer_names[layer_name][1]][0].data[:, :, 0, 0]
+            l_names = merged_layer_names[layer_name]
+            w_1 = old_params[l_names[0]][0].data[:, :, 0, 0]
+            w_2 = old_params[l_names[1]][0].data[:, :, 0, 0]
+            if len(l_names) == 3:
+                # batchnorm
+                bn_scale = old_params[l_names[2]][0].data.squeeze()
+                bn_bias = old_params[l_names[2]][1].data.squeeze()
+                bn_mean = old_params[l_names[2]][2].data.squeeze()
+                bn_var = old_params[l_names[2]][3].data.squeeze()
+                eps = 1e-5 # following caffe and also cudnn_bn_min_epsilon
+                w_1 = w_1 * bn_scale[:, None] / np.sqrt(bn_var[:, None] + eps)
+                b_1 = old_params[l_names[0]][1].data if len(old_params[l_names[0]]) > 1 else 0
+                b_1 = bn_bias + (b_1 - bn_mean) * bn_scale / np.sqrt(bn_var + eps)
+            else:
+                if len(old_params[l_names[0]]) > 1:
+                    b_1 = old_params[l_names[0]][1].data
+                else:
+                    b_1 = None
             new_w = np.matmul(w_2, w_1)[:, :, None, None]
             param[0].data[...] = new_w
             if len(param) > 1:
                 b = 0
-                if len(old_params[merged_layer_names[layer_name][0]]) > 1:
-                    b_1 = old_params[merged_layer_names[layer_name][0]][1].data
+                if b_1 is not None:
                     b = (b + np.matmul(w_2, b_1[:, None]))[:, 0]
                 if len(old_params[merged_layer_names[layer_name][0]]) > 1:
                     b_2 = old_params[merged_layer_names[layer_name][1]][1].data
@@ -156,12 +184,15 @@ def expand_dc_blocks(yaml_cfg):
     solver = _read_netsolver_from(cfg["in_proto"])
     name_index_dct = {l.name: i for i, l in enumerate(solver.layer)}
     to_expand = []
-    for conv_name, target_c in cfg["expand"]:
+    for pair in cfg["expand"]:
+        conv_name, target_c = pair[:2]
         conv_id = int(conv_name.strip("conv"))
         cur_bn_name = "batch_norm{}".format(conv_id)
-        pre_conv_name = "conv{}".format(conv_id - 1)
         pre_bn_name = "batch_norm{}".format(conv_id - 1)
-        next_conv_name = "conv{}".format(conv_id + 1)
+        
+        pre_conv_name = pair[2] if (len(pair) >= 3 and pair[2] is not None) else "conv{}".format(conv_id - 1)
+        next_conv_name =  pair[3] if len(pair) == 4 else "conv{}".format(conv_id + 1)
+
         cur_layer = solver.layer[name_index_dct[conv_name]]
         cur_c = cur_layer.convolution_param.num_output
         assert cur_layer.convolution_param.group == cur_c
@@ -183,7 +214,7 @@ def expand_dc_blocks(yaml_cfg):
             cur_layer.name = conv_name + "_ex{}".format(target_c)
             solver.layer[name_index_dct[pre_bn_name]].name = "batch_norm{}_exout{}".format(conv_id-1, target_c)
             solver.layer[name_index_dct[cur_bn_name]].name = "batch_norm{}_ex{}".format(conv_id, target_c)
-            to_expand.append((conv_name, target_c))
+            to_expand.append((conv_name, target_c, pre_conv_name, next_conv_name))
 
     # write to out_proto
     print("Writing output prototxt to {}".format(cfg["out_proto"]))
@@ -192,18 +223,17 @@ def expand_dc_blocks(yaml_cfg):
 
     # construct two nets, and copy blobs
     # by default, the weight filler is xavier?
-    bn_var_init = cfg.get("bn_variance_init", False)
+    bn_var_init = cfg.get("bn_variance_init", None)
+    bn_scale_init = cfg.get("bn_scale_init", None)
     old_net = caffe.Net(cfg["in_proto"], cfg["in_model"], caffe.TEST)
     new_net = caffe.Net(cfg["out_proto"], cfg["in_model"], caffe.TEST)
     old_params = old_net.params
     new_params = new_net.params
-    for conv_name, target_c in to_expand:
+    for conv_name, target_c, pre_conv_name, next_conv_name in to_expand:
         cur_c = old_params[conv_name][0].data.shape[0]
         conv_id = int(conv_name.strip("conv"))
         cur_bn_name = "batch_norm{}".format(conv_id)
-        pre_conv_name = "conv{}".format(conv_id - 1)
         pre_bn_name = "batch_norm{}".format(conv_id - 1)
-        next_conv_name = "conv{}".format(conv_id + 1)
 
         assert new_net.params[pre_conv_name + "_exout{}".format(target_c)][0].data.shape[0] == target_c
         assert new_net.params[conv_name + "_ex{}".format(target_c)][0].data.shape[0] == target_c
@@ -214,17 +244,35 @@ def expand_dc_blocks(yaml_cfg):
         update_blob_vec(new_net.params[pre_conv_name + "_exout{}".format(target_c)],
                         old_params[pre_conv_name], strict=False)
         update_blob_vec(new_net.params[pre_bn_name + "_exout{}".format(target_c)],
-                        old_params[pre_bn_name], strict=False)
-        if bn_var_init:
-            new_net.params[pre_bn_name + "_exout{}".format(target_c)][3].data[cur_c:] = bn_var_init
+                        old_params[pre_bn_name], strict=False,
+                        dim=1 if len(old_params[pre_bn_name][0].data.shape) > 1 else 0)
+        if bn_scale_init is not None:
+            if len(new_net.params[pre_bn_name + "_exout{}".format(target_c)][0].data.shape) == 4:
+                new_net.params[pre_bn_name + "_exout{}".format(target_c)][0].data[0, cur_c:, 0, 0] = bn_scale_init
+            else:
+                new_net.params[pre_bn_name + "_exout{}".format(target_c)][0].data[cur_c:] = bn_scale_init
+        if bn_var_init is not None:
+            if len(new_net.params[pre_bn_name + "_exout{}".format(target_c)][3].data.shape) == 4:
+                new_net.params[pre_bn_name + "_exout{}".format(target_c)][3].data[0, cur_c:, 0, 0] = bn_var_init
+            else:
+                new_net.params[pre_bn_name + "_exout{}".format(target_c)][3].data[cur_c:] = bn_var_init
 
         # copy cur conv bn
         update_blob_vec(new_net.params[conv_name + "_ex{}".format(target_c)],
                         old_params[conv_name], strict=False)
         update_blob_vec(new_net.params[cur_bn_name + "_ex{}".format(target_c)],
-                        old_params[cur_bn_name], strict=False)
-        if bn_var_init:
-            new_net.params[cur_bn_name + "_ex{}".format(target_c)][3].data[cur_c:] = bn_var_init
+                        old_params[cur_bn_name], strict=False,
+                        dim=1 if len(old_params[cur_bn_name][0].data.shape) > 1 else 0)
+        if bn_scale_init is not None:
+            if len(new_net.params[cur_bn_name + "_ex{}".format(target_c)][0].data.shape) == 4:
+                new_net.params[cur_bn_name + "_ex{}".format(target_c)][0].data[0, cur_c:, 0, 0] = bn_scale_init
+            else:
+                new_net.params[cur_bn_name + "_ex{}".format(target_c)][0].data[cur_c:] = bn_scale_init
+        if bn_var_init is not None:
+            if len(new_net.params[cur_bn_name + "_ex{}".format(target_c)][3].data.shape) == 4:
+                new_net.params[cur_bn_name + "_ex{}".format(target_c)][3].data[0, cur_c:, 0, 0] = bn_var_init
+            else:
+                new_net.params[cur_bn_name + "_ex{}".format(target_c)][3].data[cur_c:] = bn_var_init
 
         # copy next conv
         update_blob_vec(new_net.params[next_conv_name + "_exin{}".format(target_c)],
@@ -237,6 +285,7 @@ def expand_dc_blocks(yaml_cfg):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-q", "--quiet", default=False, action="store_true")
+    parser.add_argument("-c", "--caffe-path", default="/home/foxfi/projects/lpcvc/caffe_nics/python/")
 
     subparsers = parser.add_subparsers(dest="op")
     mc_parser = subparsers.add_parser("merge-convs")
@@ -250,6 +299,9 @@ if __name__ == "__main__":
     
     if args.quiet:
         os.environ["GLOG_minloglevel"] = "2"
+    if args.caffe_path:
+        sys.path.insert(0, args.caffe_path)
+
     print("Execute {}".format(args.op))
     assert args.op in ["merge-convs", "expand-dcblock"]
     if args.op == "merge-convs":
