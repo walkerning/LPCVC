@@ -33,8 +33,7 @@ def _get_divisible_by(num, divisible_by, min_val=None):
 
 class NxBlock(nn.Module):
     """
-    postrelu/prerelu对latency有没有区别
-    会不会pre_relu (conv bn relu add) 比 (conv bn add relu) 要快, 虽然少做了一个relu? 因为会fuse? 试一下
+    pre_relu (conv bn relu add) might be faster than (conv bn add relu) because relu will be fused with conv
     """
     def __init__(self, C_in, C_out, kernel_size, stride, expansion, bn=True, res_type="Ck_C1", depth_divisible=8, pre_relu=True, stride_skip=True, use_final_relu=False, use_depthwise=True, force_no_skip=False, force_no_pre=False, force_inner_channel=None):
         assert res_type in {"Ck_C1", "k_C1", "skip"} #, "factorized", ""}
@@ -557,6 +556,7 @@ channel_model_dct = _produce_channels()
 globals().update(channel_model_dct)
 
 def _produce_prune_targets(to_int="ceil", stem=32, div=10, input_size=224):
+    # produce prune targets from original mnasnet100, ITER 1 only
     _prune_model_dct = {}
     mnasnet_100_ori_block_cs = sum([[48, 72, 72], [72, 120, 120], [240, 480, 480], [480, 576], [576, 1152, 1152, 1152], [1152]], [])
     assert len(mnasnet_100_ori_block_cs) == 16
