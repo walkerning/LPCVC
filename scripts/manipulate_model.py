@@ -33,6 +33,33 @@ def _modify_message_per_field_in_place(message, field, value):
         else:
             setattr(message, field, value)
 
+def add_noise(tensor):
+    std = np.std(tensor)
+    noise = np.random.normal(0, std*1e-2, size=tensor.shape)
+    return tensor + noise
+
+def morphism_blob_vec(old_blob_vec, new_data_vec, expand_ind, dim=0):
+    for i in range(len(new_data_vec)):
+        new_data = new_data_vec[i]
+        if not isinstance(new_data, np.ndarray) and hasattr(new_data, 'data'):
+            new_data = new_data.data
+        if dim == 1 and len(new_data.shape) > 1:
+            if new_data.shape[1] > 1:
+                old_blob_vec[i].data[:,-len(expand_ind):,:,:] = add_noise(new_data[:,expand_ind])
+            else:
+                old_blob_vec[i].data[...] = new_data
+        else:
+            old_blob_vec[i].data[-len(expand_ind):] = add_noise(new_data[expand_ind])
+
+def morphism_input_blob_vec(old_blob_vec, new_data_vec, expand_ind, expand_times):
+    new_data = new_data_vec[0]
+    if not isinstance(new_data, np.ndarray) and hasattr(new_data, 'data'):
+        new_data = new_data.data        
+    old_blob_vec[0].data[:,-len(expand_ind):,:,:] = add_noise(new_data[:,expand_ind,:,:])
+    expand_shape = [1 for x in old_blob_vec[0].data.shape]
+    expand_shape[1] = len(expand_times)
+    old_blob_vec[0].data[...] /= np.array(expand_times).reshape(expand_shape)
+
 def update_blob_vec(old_blob_vec, new_data_vec, strict=True, dim=0):
     for i in range(len(new_data_vec)):
         new_data = new_data_vec[i]
@@ -181,6 +208,7 @@ def expand_dc_blocks(yaml_cfg):
         cfg = yaml.load(rf)
     expand_to_ceil = cfg.get("expand_to_ceil", False)
     divisible = cfg.get("divisible", 10)
+    morphism = cfg.get("morphism", False)
     solver = _read_netsolver_from(cfg["in_proto"])
     name_index_dct = {l.name: i for i, l in enumerate(solver.layer)}
     to_expand = []
@@ -234,18 +262,30 @@ def expand_dc_blocks(yaml_cfg):
         conv_id = int(conv_name.strip("conv"))
         cur_bn_name = "batch_norm{}".format(conv_id)
         pre_bn_name = "batch_norm{}".format(conv_id - 1)
-
+        print("cur_name: {}".format(conv_name))
         assert new_net.params[pre_conv_name + "_exout{}".format(target_c)][0].data.shape[0] == target_c
         assert new_net.params[conv_name + "_ex{}".format(target_c)][0].data.shape[0] == target_c
         assert new_net.params[next_conv_name + "_exin{}".format(target_c)][0].data.shape[1] == target_c
         print("Change caffe model: Expand {} from {} to {}".format(conv_name, cur_c, target_c))
-
+        
+        expand_ind = np.random.randint(0, cur_c, size=[(target_c - cur_c)])
+        expand_times = [1 for x in range(target_c)]
+        for i in expand_ind:
+            expand_times[i] += 1
+        for i in range(cur_c, target_c):
+            expand_times[i] = expand_times[expand_ind[i - cur_c]]
+        
         # copy prev conv bn
         update_blob_vec(new_net.params[pre_conv_name + "_exout{}".format(target_c)],
                         old_params[pre_conv_name], strict=False)
         update_blob_vec(new_net.params[pre_bn_name + "_exout{}".format(target_c)],
                         old_params[pre_bn_name], strict=False,
                         dim=1 if len(old_params[pre_bn_name][0].data.shape) > 1 else 0)
+        if morphism:
+            morphism_blob_vec(new_net.params[pre_conv_name + "_exout{}".format(target_c)],
+                        old_params[pre_conv_name], expand_ind)
+            morphism_blob_vec(new_net.params[pre_bn_name + "_exout{}".format(target_c)],
+                        old_params[pre_bn_name], expand_ind, dim=1 if len(old_params[pre_bn_name][0].data.shape) > 1 else 0)
         if bn_scale_init is not None:
             if len(new_net.params[pre_bn_name + "_exout{}".format(target_c)][0].data.shape) == 4:
                 new_net.params[pre_bn_name + "_exout{}".format(target_c)][0].data[0, cur_c:, 0, 0] = bn_scale_init
@@ -256,13 +296,19 @@ def expand_dc_blocks(yaml_cfg):
                 new_net.params[pre_bn_name + "_exout{}".format(target_c)][3].data[0, cur_c:, 0, 0] = bn_var_init
             else:
                 new_net.params[pre_bn_name + "_exout{}".format(target_c)][3].data[cur_c:] = bn_var_init
-
         # copy cur conv bn
         update_blob_vec(new_net.params[conv_name + "_ex{}".format(target_c)],
                         old_params[conv_name], strict=False)
         update_blob_vec(new_net.params[cur_bn_name + "_ex{}".format(target_c)],
                         old_params[cur_bn_name], strict=False,
                         dim=1 if len(old_params[cur_bn_name][0].data.shape) > 1 else 0)
+        if morphism:
+            morphism_blob_vec(new_net.params[conv_name + "_ex{}".format(target_c)],
+                        old_params[conv_name], expand_ind)
+            morphism_blob_vec(new_net.params[cur_bn_name + "_ex{}".format(target_c)],
+                        old_params[cur_bn_name], expand_ind,
+                        dim=1 if len(old_params[cur_bn_name][0].data.shape) > 1 else 0)
+       
         if bn_scale_init is not None:
             if len(new_net.params[cur_bn_name + "_ex{}".format(target_c)][0].data.shape) == 4:
                 new_net.params[cur_bn_name + "_ex{}".format(target_c)][0].data[0, cur_c:, 0, 0] = bn_scale_init
@@ -277,6 +323,10 @@ def expand_dc_blocks(yaml_cfg):
         # copy next conv
         update_blob_vec(new_net.params[next_conv_name + "_exin{}".format(target_c)],
                         old_params[next_conv_name], strict=False, dim=1)
+
+        if morphism:
+            morphism_input_blob_vec(new_net.params[next_conv_name + "_exin{}".format(target_c)],
+                        old_params[next_conv_name], expand_ind, expand_times)
 
     print("Save output caffe model to {}".format(cfg["out_model"]))
     new_net.save(cfg["out_model"])
